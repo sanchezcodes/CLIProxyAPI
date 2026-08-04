@@ -751,6 +751,13 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					}
 
 					statusCode := statusCodeFromResult(result.Error)
+					// Anthropic OAuth "out of extra usage" arrives as 400
+					// invalid_request_error but is per-credential subscription
+					// quota. Promote to 429 so the auth cools down and the
+					// retry loop can rotate to another credential.
+					if statusCode == http.StatusBadRequest && isClaudeOutOfExtraUsageResultError(result.Error) {
+						statusCode = http.StatusTooManyRequests
+					}
 					if isModelSupportResultError(result.Error) {
 						next := now.Add(12 * time.Hour)
 						state.NextRetryAfter = next
@@ -1532,12 +1539,42 @@ func isMissingModelPhrase(value string) bool {
 	}
 }
 
+// isClaudeOutOfExtraUsageMessage reports whether a message is Anthropic's
+// OAuth subscription-quota exhaustion. Anthropic labels it
+// invalid_request_error (HTTP 400) even though it is per-credential.
+func isClaudeOutOfExtraUsageMessage(message string) bool {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if lower == "" {
+		return false
+	}
+	// Observed wordings:
+	// - "You're out of extra usage. Add more at claude.ai/settings/usage and keep going."
+	// - "You're out of extra usage. Ask your workspace admin to add more so you can keep going."
+	return strings.Contains(lower, "out of extra usage") ||
+		strings.Contains(lower, "claude.ai/settings/usage")
+}
+
+func isClaudeOutOfExtraUsageError(err error) bool {
+	if err == nil || statusCodeFromError(err) != http.StatusBadRequest {
+		return false
+	}
+	return isClaudeOutOfExtraUsageMessage(err.Error())
+}
+
+func isClaudeOutOfExtraUsageResultError(err *Error) bool {
+	if err == nil || statusCodeFromResult(err) != http.StatusBadRequest {
+		return false
+	}
+	return isClaudeOutOfExtraUsageMessage(err.Message)
+}
+
 // isRequestInvalidError returns true if the error represents a client request
 // error that should not be retried. Specifically, it treats 400 responses with
 // "invalid_request_error", request-scoped 404 item misses caused by `store=false`,
 // and all 422 responses as request-shape failures, where switching auths or
 // pooled upstream models will not help. Model-support errors are excluded so
-// routing can fall through to another auth or upstream.
+// routing can fall through to another auth or upstream. Anthropic "out of extra
+// usage" 400s are also excluded: they are per-credential quota and must rotate.
 func isRequestInvalidError(err error) bool {
 	if err == nil {
 		return false
@@ -1552,6 +1589,10 @@ func isRequestInvalidError(err error) bool {
 		return false
 	}
 	if isModelSupportError(err) {
+		return false
+	}
+	// Subscription extra-usage exhaustion is per-credential, not per-request.
+	if isClaudeOutOfExtraUsageError(err) {
 		return false
 	}
 	status := statusCodeFromError(err)
@@ -1598,6 +1639,10 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		}
 	}
 	statusCode := statusCodeFromResult(resultErr)
+	// See MarkResult: Anthropic "out of extra usage" 400 is per-credential quota.
+	if statusCode == http.StatusBadRequest && isClaudeOutOfExtraUsageResultError(resultErr) {
+		statusCode = http.StatusTooManyRequests
+	}
 	if isCloudflareChallengeResultError(resultErr) {
 		auth.StatusMessage = "cloudflare challenge"
 		next, backoffLevel := nextCloudflareCooldown(auth.Quota.BackoffLevel, disableCooling, now)

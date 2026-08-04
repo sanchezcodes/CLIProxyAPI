@@ -1760,3 +1760,105 @@ func TestManager_RequestScopedNotFoundStopsRetryWithoutSuspendingAuth(t *testing
 		t.Fatalf("expected request-scoped 404 to avoid bad auth model cooldown state, got %#v", state)
 	}
 }
+
+func TestIsRequestInvalidError_OutOfExtraUsageIsRetryable(t *testing.T) {
+	workspaceAdmin := &Error{
+		HTTPStatus: http.StatusBadRequest,
+		Message:    `{"type":"error","error":{"type":"invalid_request_error","message":"You're out of extra usage. Ask your workspace admin to add more so you can keep going."}}`,
+	}
+	settingsUsage := &Error{
+		HTTPStatus: http.StatusBadRequest,
+		Message:    `{"type":"error","error":{"type":"invalid_request_error","message":"You're out of extra usage. Add more at claude.ai/settings/usage and keep going."}}`,
+	}
+	genuine := &Error{
+		HTTPStatus: http.StatusBadRequest,
+		Message:    `{"type":"error","error":{"type":"invalid_request_error","message":"messages.0.content: Field required"}}`,
+	}
+
+	if isRequestInvalidError(workspaceAdmin) {
+		t.Fatal("workspace-admin extra-usage 400 must remain credential-retryable")
+	}
+	if isRequestInvalidError(settingsUsage) {
+		t.Fatal("settings/usage extra-usage 400 must remain credential-retryable")
+	}
+	if !isRequestInvalidError(genuine) {
+		t.Fatal("genuine invalid_request_error must stay request-scoped")
+	}
+}
+
+func TestManager_OutOfExtraUsageBadRequest_FallsBackAndCoolsAuth(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	extraUsageErr := &Error{
+		HTTPStatus: http.StatusBadRequest,
+		Message:    `{"type":"error","error":{"type":"invalid_request_error","message":"You're out of extra usage. Ask your workspace admin to add more so you can keep going."}}`,
+	}
+	executor := &authFallbackExecutor{
+		id: "claude",
+		executeErrors: map[string]error{
+			"aa-depleted-auth": extraUsageErr,
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	model := "claude-fable-5"
+	// IDs sort so depleted is preferred first (same pattern as model-support test).
+	depleted := &Auth{ID: "aa-depleted-auth", Provider: "claude"}
+	healthy := &Auth{ID: "bb-healthy-auth", Provider: "claude"}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(depleted.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(healthy.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(depleted.ID)
+		reg.UnregisterClient(healthy.ID)
+	})
+
+	if _, errRegister := m.Register(context.Background(), depleted); errRegister != nil {
+		t.Fatalf("register depleted auth: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), healthy); errRegister != nil {
+		t.Fatalf("register healthy auth: %v", errRegister)
+	}
+
+	request := cliproxyexecutor.Request{Model: model}
+	for i := 0; i < 2; i++ {
+		resp, errExecute := m.Execute(context.Background(), []string{"claude"}, request, cliproxyexecutor.Options{})
+		if errExecute != nil {
+			t.Fatalf("execute %d error = %v, want success via rotation", i, errExecute)
+		}
+		if string(resp.Payload) != healthy.ID {
+			t.Fatalf("execute %d payload = %q, want %q", i, string(resp.Payload), healthy.ID)
+		}
+	}
+
+	got := executor.ExecuteCalls()
+	// First request: depleted fails → rotate to healthy. Second request: depleted
+	// is on quota cooldown so only healthy is tried.
+	want := []string{depleted.ID, healthy.ID, healthy.ID}
+	if len(got) != len(want) {
+		t.Fatalf("execute calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("execute call %d auth = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	updated, ok := m.GetByID(depleted.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected depleted auth to remain registered")
+	}
+	state := updated.ModelStates[model]
+	if state == nil {
+		t.Fatalf("expected model state for %q", model)
+	}
+	if !state.Unavailable {
+		t.Fatalf("expected depleted auth model state to be unavailable after extra-usage")
+	}
+	if !state.Quota.Exceeded {
+		t.Fatalf("expected depleted auth quota to be marked exceeded")
+	}
+	if state.NextRetryAfter.IsZero() {
+		t.Fatalf("expected depleted auth cooldown to be set")
+	}
+}
