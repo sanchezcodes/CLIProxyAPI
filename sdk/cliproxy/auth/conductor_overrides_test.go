@@ -2486,3 +2486,100 @@ func TestManager_MarkResult_RequestFaultBodyDoesNotCooldownModelOrAuth(t *testin
 		t.Fatalf("expected real 401 authentication error to set model cooldown state, got %#v", state)
 	}
 }
+
+func TestIsRequestInvalidError_ClaudeOutOfExtraUsageIsRetryable(t *testing.T) {
+	tests := []struct {
+		name    string
+		message string
+	}{
+		{
+			name:    "workspace admin",
+			message: `{"type":"error","error":{"type":"invalid_request_error","message":"You're out of extra usage. Ask your workspace admin to add more so you can keep going."}}`,
+		},
+		{
+			name:    "settings usage",
+			message: `{"type":"error","error":{"type":"invalid_request_error","message":"You're out of extra usage. Add more at claude.ai/settings/usage and keep going."}}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			errExtraUsage := &Error{HTTPStatus: http.StatusBadRequest, Message: tc.message}
+			if isRequestInvalidError(errExtraUsage) {
+				t.Fatal("Claude extra-usage 400 must remain eligible for credential rotation")
+			}
+		})
+	}
+
+	genuineBadRequest := &Error{
+		HTTPStatus: http.StatusBadRequest,
+		Message:    `{"type":"error","error":{"type":"invalid_request_error","message":"messages.0.content: Field required"}}`,
+	}
+	if !isRequestInvalidError(genuineBadRequest) {
+		t.Fatal("genuine invalid_request_error must remain request-scoped")
+	}
+}
+
+func TestManager_ClaudeOutOfExtraUsageRotatesAndCoolsCredential(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(2, 30*time.Second, 0)
+
+	const provider = "claude"
+	model := "claude-extra-usage-rotation-" + uuid.NewString()
+	extraUsageErr := &Error{
+		HTTPStatus: http.StatusBadRequest,
+		Message:    `{"type":"error","error":{"type":"invalid_request_error","message":"You're out of extra usage. Add more at claude.ai/settings/usage and keep going."}}`,
+	}
+	executor := &authFallbackExecutor{
+		id: provider,
+		executeErrors: map[string]error{
+			"aa-depleted-auth": extraUsageErr,
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	depleted := &Auth{ID: "aa-depleted-auth", Provider: provider}
+	healthy := &Auth{ID: "bb-healthy-auth", Provider: provider}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(depleted.ID, provider, []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(healthy.ID, provider, []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(depleted.ID)
+		reg.UnregisterClient(healthy.ID)
+	})
+
+	if _, errRegister := m.Register(context.Background(), depleted); errRegister != nil {
+		t.Fatalf("register depleted auth: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), healthy); errRegister != nil {
+		t.Fatalf("register healthy auth: %v", errRegister)
+	}
+
+	request := cliproxyexecutor.Request{Model: model}
+	for i := 0; i < 2; i++ {
+		resp, errExecute := m.Execute(context.Background(), []string{provider}, request, cliproxyexecutor.Options{})
+		if errExecute != nil {
+			t.Fatalf("execute %d: %v", i, errExecute)
+		}
+		if got := string(resp.Payload); got != healthy.ID {
+			t.Fatalf("execute %d served by %q, want %q", i, got, healthy.ID)
+		}
+	}
+
+	wantCalls := []string{depleted.ID, healthy.ID, healthy.ID}
+	if calls := executor.ExecuteCalls(); !slices.Equal(calls, wantCalls) {
+		t.Fatalf("credential calls = %v, want %v", calls, wantCalls)
+	}
+
+	updated, ok := m.GetByID(depleted.ID)
+	if !ok || updated == nil {
+		t.Fatal("expected depleted auth to remain registered")
+	}
+	state := updated.ModelStates[model]
+	if state == nil || !state.Unavailable || state.NextRetryAfter.IsZero() {
+		t.Fatalf("depleted auth model state = %#v, want active cooldown", state)
+	}
+	if !state.Quota.Exceeded || state.Quota.Reason != "quota" {
+		t.Fatalf("depleted auth quota state = %#v, want exceeded quota", state.Quota)
+	}
+}

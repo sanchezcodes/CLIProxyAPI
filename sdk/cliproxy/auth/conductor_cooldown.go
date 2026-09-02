@@ -792,6 +792,12 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					}
 
 					statusCode := statusCodeFromResult(result.Error)
+					// Anthropic reports exhausted OAuth extra usage as HTTP 400 even
+					// though it is credential quota. Route it through the existing 429
+					// cooldown path so another credential can serve the request.
+					if statusCode == http.StatusBadRequest && isClaudeOutOfExtraUsageResultError(result.Error) {
+						statusCode = http.StatusTooManyRequests
+					}
 					if isModelSupportResultError(result.Error) {
 						next := now.Add(12 * time.Hour)
 						state.NextRetryAfter = next
@@ -1929,9 +1935,34 @@ func isMissingModelPhrase(value string) bool {
 	}
 }
 
+// isClaudeOutOfExtraUsageMessage reports whether message contains Anthropic's
+// OAuth subscription quota exhaustion response.
+func isClaudeOutOfExtraUsageMessage(message string) bool {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if lower == "" {
+		return false
+	}
+	return strings.Contains(lower, "out of extra usage") ||
+		strings.Contains(lower, "claude.ai/settings/usage")
+}
+
+func isClaudeOutOfExtraUsageError(err error) bool {
+	if err == nil || statusCodeFromError(err) != http.StatusBadRequest {
+		return false
+	}
+	return isClaudeOutOfExtraUsageMessage(err.Error())
+}
+
+func isClaudeOutOfExtraUsageResultError(err *Error) bool {
+	if err == nil || statusCodeFromResult(err) != http.StatusBadRequest {
+		return false
+	}
+	return isClaudeOutOfExtraUsageMessage(err.Message)
+}
+
 // isRequestInvalidError returns true if the error represents a client request
 // error that should neither rotate nor penalize credentials. Model-support
-// errors remain eligible for alternate routing and keep their model-level state.
+// errors and credential-scoped quota errors remain eligible for alternate routing.
 func isRequestInvalidError(err error) bool {
 	if err == nil {
 		return false
@@ -1946,6 +1977,9 @@ func isRequestInvalidError(err error) bool {
 		return false
 	}
 	if isModelSupportError(err) {
+		return false
+	}
+	if isClaudeOutOfExtraUsageError(err) {
 		return false
 	}
 	status := statusCodeFromError(err)
@@ -1986,6 +2020,9 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		}
 	}
 	statusCode := statusCodeFromResult(resultErr)
+	if statusCode == http.StatusBadRequest && isClaudeOutOfExtraUsageResultError(resultErr) {
+		statusCode = http.StatusTooManyRequests
+	}
 	if isCloudflareChallengeResultError(resultErr) {
 		auth.StatusMessage = "cloudflare challenge"
 		next, backoffLevel := nextCloudflareCooldown(auth.Quota.BackoffLevel, disableCooling, now)
