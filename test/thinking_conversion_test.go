@@ -2511,7 +2511,7 @@ func TestThinkingE2EProviderTargets(t *testing.T) {
 			inputJSON:       `{"model":"antigravity-budget-model","input":"hi","reasoning":{"effort":"medium"}}`,
 			expectField:     "request.generationConfig.thinkingConfig.thinkingBudget",
 			expectValue:     "8192",
-			includeThoughts: "",
+			includeThoughts: "true",
 		},
 	}
 
@@ -3494,6 +3494,14 @@ func runThinkingTests(t *testing.T, cases []thinkingTestCase) {
 			assertField(tc.expectField, tc.expectValue)
 			if tc.expectField2 != "" {
 				assertField(tc.expectField2, tc.expectValue2)
+			}
+
+			// Claude adaptive effort is only valid as a pair: native Claude Code
+			// 2.1.220 always sends thinking.type="adaptive" alongside
+			// output_config.effort. Emitting effort on its own would be a wire
+			// shape the real client never produces.
+			if tc.to == "claude" && gjson.GetBytes(body, "output_config.effort").Exists() {
+				assertField("thinking.type", "adaptive")
 			}
 			if tc.expectField3 != "" {
 				assertField(tc.expectField3, tc.expectValue3)
