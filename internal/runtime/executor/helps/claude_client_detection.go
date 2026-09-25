@@ -234,7 +234,7 @@ func normalizedClaudeBetaHeader(headers http.Header) string {
 // exact beta allowlist, the body shape, the billing CCH and the session binding -
 // stay strict.
 func measuredClaudeCodeHelperHeadersMatch(headers http.Header, cfg *config.Config, shape claudeCodeHelperShape) bool {
-	profile := defaultClaudeDeviceProfile(cfg)
+	profile := claudeDetectionBaseline(cfg)
 	expected := map[string]string{
 		"Accept":                  "application/json",
 		"Content-Type":            "application/json",
@@ -465,13 +465,24 @@ func claudeJSONObjectHasKeys(raw []byte, want []string) bool {
 	return errClosing == nil && closing == json.Delim('}') && keyIndex == len(want)
 }
 
+// claudeDetectionBaseline keeps recognizing the previously measured native client
+// while the outbound fallback advertises the newer minimum required by models.
+func claudeDetectionBaseline(cfg *config.Config) ClaudeDeviceProfile {
+	profile := defaultClaudeDeviceProfile(cfg)
+	if cfg == nil || strings.TrimSpace(cfg.ClaudeHeaderDefaults.UserAgent) == "" {
+		profile.UserAgent = "claude-cli/2.1.258 (external, cli)"
+		profile.version, profile.hasVersion = parseClaudeCLIVersion(profile.UserAgent)
+	}
+	return profile
+}
+
 func plausibleClaudeCodeUserAgent(userAgent string, cfg *config.Config) bool {
 	userAgent = strings.TrimSpace(userAgent)
 	if !claudeCodeUserAgentPattern.MatchString(userAgent) || !claudeCodeNativeUserAgentPattern.MatchString(userAgent) {
 		return false
 	}
 	candidate, okCandidate := parseClaudeCLIVersion(userAgent)
-	baseline, okBaseline := parseClaudeCLIVersion(defaultClaudeDeviceProfile(cfg).UserAgent)
+	baseline, okBaseline := parseClaudeCLIVersion(claudeDetectionBaseline(cfg).UserAgent)
 	// Patch releases (>= baseline.patch) within the release line preserve native passthrough.
 	return okCandidate && okBaseline && plausibleClaudeCLIVersion(candidate, baseline)
 }

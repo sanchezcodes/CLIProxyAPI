@@ -30,7 +30,7 @@ func measuredClaudeCodeHelperHeaders(betaProfile string) http.Header {
 		"Accept":            {"application/json"},
 		"Accept-Encoding":   {"gzip, deflate, br, zstd"},
 		"Content-Type":      {"application/json"},
-		"User-Agent":        {profile.UserAgent},
+		"User-Agent":        {"claude-cli/2.1.258 (external, cli)"},
 		"X-App":             {"cli"},
 		"Anthropic-Beta":    {betaProfile},
 		"Anthropic-Version": {"2023-06-01"},
