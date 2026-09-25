@@ -130,7 +130,7 @@ func TestResolveClaudeDeviceProfileLocalUsesBaselineForInvalidSignals(t *testing
 func TestResolveClaudeDeviceProfileLocalKeepsExactMeasuredSoftwareBaseline(t *testing.T) {
 	ResetClaudeDeviceProfileCache()
 	auth := &cliproxyauth.Auth{ID: "auth-newer-patch-signals"}
-	headers := claudeDeviceHeaders("claude-cli/2.1.263 (external, cli)")
+	headers := claudeDeviceHeaders("claude-cli/2.1.281 (external, cli)")
 
 	profile := resolveClaudeDeviceProfileLocal(auth, "api-key", headers, nil)
 	baseline := defaultClaudeDeviceProfile(nil)
