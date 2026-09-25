@@ -15,6 +15,7 @@ go test -v -run TestName ./path/to/pkg # Run single test
 go build -o test-output ./cmd/server && rm test-output # Verify compile (REQUIRED after changes)
 ```
 - Common flags: `--config <path>`, `--tui`, `--standalone`, `--local-model`, `--no-browser`, `--oauth-callback-port <port>`
+- Upgrading this fork to a new upstream release, or deploying/restarting the VPS service: follow `docs/FORK-UPGRADE.md`.
 
 ## Config
 - Default config: `config.yaml` (template: `config.example.yaml`)
