@@ -58,11 +58,18 @@ func (c *Client) rebalanceCommand(ctx context.Context, address string, args ...a
 	}
 	options.ReadTimeout = -1
 	options.WriteTimeout = -1
-	options.Dialer = redis.NewDialer(options)
+	baseDialer := redis.NewDialer(options)
+	options.Dialer = func(dialCtx context.Context, network, address string) (net.Conn, error) {
+		conn, errDial := baseDialer(dialCtx, network, address)
+		if errDial != nil {
+			return nil, errDial
+		}
+		// Close the transport directly on cancellation: a pool close can block
+		// checking the health of a connection that is waiting for an RPC reply.
+		return newPluginSyncCancelableConn(ctx, conn), nil
+	}
 	command := redis.NewClient(options)
-	stopCancel := context.AfterFunc(ctx, func() { _ = command.Close() })
 	defer func() {
-		stopCancel()
 		if errClose := command.Close(); errClose != nil && ctx.Err() == nil {
 			log.Debugf("Home rebalance transport close failed: %v", errClose)
 		}
