@@ -261,7 +261,7 @@ func matchesMeasuredClaudeCodeHaiku55HelperProfile(
 }
 
 func measuredClaudeCodeHaiku55HelperHeadersMatch(headers http.Header, cfg *config.Config) bool {
-	profile := defaultClaudeDeviceProfile(cfg)
+	profile := claudeMeasuredHelperProfile(cfg)
 	expected := map[string]string{
 		"Accept":                  "application/json",
 		"Content-Type":            "application/json",
@@ -432,7 +432,7 @@ func normalizedClaudeBetaHeader(headers http.Header) string {
 // exact beta allowlist, the body shape, the billing CCH and the session binding -
 // stay strict.
 func measuredClaudeCodeHelperHeadersMatch(headers http.Header, cfg *config.Config, shape claudeCodeHelperShape) bool {
-	profile := defaultClaudeDeviceProfile(cfg)
+	profile := claudeMeasuredHelperProfile(cfg)
 	expected := map[string]string{
 		"Accept":                  "application/json",
 		"Content-Type":            "application/json",
@@ -686,11 +686,44 @@ func claudeJSONObjectHasKeys(raw []byte, want []string) bool {
 
 // claudeDetectionBaseline keeps recognizing the previously measured native client
 // while the outbound fallback advertises the newer minimum required by models.
+//
+// The SDK package and runtime floors follow the same rule: native clients from
+// the measured floor up (@anthropic-ai/sdk 0.112.1, runtime v26.3.0) keep their
+// own values even though the outbound default advertises 2.1.321's 0.128.0 and
+// v26.12.1. Without this, an older confirmed client would leave with its own
+// User-Agent but the newer SDK headers, a combination no real client sends.
 func claudeDetectionBaseline(cfg *config.Config) ClaudeDeviceProfile {
 	profile := defaultClaudeDeviceProfile(cfg)
 	if cfg == nil || strings.TrimSpace(cfg.ClaudeHeaderDefaults.UserAgent) == "" {
 		profile.UserAgent = "claude-cli/2.1.258 (external, cli)"
 		profile.version, profile.hasVersion = parseClaudeCLIVersion(profile.UserAgent)
+	}
+	if cfg == nil || strings.TrimSpace(cfg.ClaudeHeaderDefaults.PackageVersion) == "" {
+		profile.PackageVersion = "0.112.1"
+	}
+	if cfg == nil || strings.TrimSpace(cfg.ClaudeHeaderDefaults.RuntimeVersion) == "" {
+		profile.RuntimeVersion = "v26.3.0"
+	}
+	return profile
+}
+
+// claudeMeasuredHelperProfile is the software profile the native helper shapes
+// below were measured on (Claude Code 2.1.280, @anthropic-ai/sdk 0.112.1, runtime
+// v26.3.0). The outbound fingerprint moved to 2.1.321, whose helper betas have
+// not been measured, so helper detection stays pinned to the measured release
+// instead of following the outbound default. Configured header defaults still win.
+func claudeMeasuredHelperProfile(cfg *config.Config) ClaudeDeviceProfile {
+	profile := defaultClaudeDeviceProfile(cfg)
+	if cfg != nil && strings.TrimSpace(cfg.ClaudeHeaderDefaults.UserAgent) != "" {
+		return profile
+	}
+	profile.UserAgent = "claude-cli/2.1.280 (external, cli)"
+	profile.version, profile.hasVersion = parseClaudeCLIVersion(profile.UserAgent)
+	if cfg == nil || strings.TrimSpace(cfg.ClaudeHeaderDefaults.PackageVersion) == "" {
+		profile.PackageVersion = "0.112.1"
+	}
+	if cfg == nil || strings.TrimSpace(cfg.ClaudeHeaderDefaults.RuntimeVersion) == "" {
+		profile.RuntimeVersion = "v26.3.0"
 	}
 	return profile
 }

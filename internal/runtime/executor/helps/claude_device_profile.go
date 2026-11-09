@@ -20,9 +20,9 @@ import (
 )
 
 const (
-	defaultClaudeFingerprintUserAgent      = "claude-cli/2.1.280 (external, cli)"
-	defaultClaudeFingerprintPackageVersion = "0.112.1"
-	defaultClaudeFingerprintRuntimeVersion = "v26.3.0"
+	defaultClaudeFingerprintUserAgent      = "claude-cli/2.1.321 (external, cli)"
+	defaultClaudeFingerprintPackageVersion = "0.128.0"
+	defaultClaudeFingerprintRuntimeVersion = "v26.12.1"
 	defaultClaudeFingerprintOS             = "MacOS"
 	defaultClaudeFingerprintArch           = "arm64"
 	claudeDeviceProfileTTL                 = 7 * 24 * time.Hour
@@ -638,14 +638,14 @@ func ApplyClaudeDeviceProfileHeaders(r *http.Request, profile ClaudeDeviceProfil
 	r.Header.Set("X-Stainless-Arch", profile.Arch)
 }
 
-// DefaultClaudeVersion returns the version string (e.g. "2.1.280") from the
+// DefaultClaudeVersion returns the version string (e.g. "2.1.321") from the
 // current baseline device profile. It extracts the version from the User-Agent.
 func DefaultClaudeVersion(cfg *config.Config) string {
 	profile := defaultClaudeDeviceProfile(cfg)
 	if version, ok := parseClaudeCLIVersion(profile.UserAgent); ok {
 		return strconv.Itoa(version.major) + "." + strconv.Itoa(version.minor) + "." + strconv.Itoa(version.patch)
 	}
-	return "2.1.280"
+	return "2.1.321"
 }
 
 func ApplyClaudeDefaultDeviceProfileHeaders(r *http.Request, cfg *config.Config) {
@@ -670,17 +670,18 @@ func ApplyClaudeLegacyDeviceHeaders(r *http.Request, ginHeaders http.Header, cfg
 	}
 
 	if confirmedClaudeCode {
+		floor := claudeDetectionBaseline(cfg)
 		validRuntime := func(value string) bool {
 			if !allowNewer && cfg != nil && strings.TrimSpace(cfg.ClaudeHeaderDefaults.RuntimeVersion) != "" {
 				return value == profile.RuntimeVersion
 			}
-			return plausibleClaudeRuntimeVersion(value, profile.RuntimeVersion)
+			return plausibleClaudeRuntimeVersion(value, floor.RuntimeVersion)
 		}
 		validPackage := func(value string) bool {
 			if !allowNewer && cfg != nil && strings.TrimSpace(cfg.ClaudeHeaderDefaults.PackageVersion) != "" {
 				return value == profile.PackageVersion
 			}
-			return plausibleClaudePackageVersion(value, profile.PackageVersion)
+			return plausibleClaudePackageVersion(value, floor.PackageVersion)
 		}
 		miscEnsure("X-Stainless-Runtime-Version", profile.RuntimeVersion, validRuntime)
 		miscEnsure("X-Stainless-Package-Version", profile.PackageVersion, validPackage)

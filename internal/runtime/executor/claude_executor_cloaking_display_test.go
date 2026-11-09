@@ -41,7 +41,9 @@ func TestReconcileClaudeCloakDisplayAfterThinkingOverride(t *testing.T) {
 }
 
 func TestReconcileClaudeCloakDisplayRemovesSyntheticDisplayForNonProgressModel(t *testing.T) {
-	body := []byte(`{"model":"claude-opus-4-8","thinking":{"type":"adaptive","display":"updates"}}`)
+	// Claude Code 2.1.321 fills display=updates on every interleaved-thinking
+	// model; Haiku 4.5 is the remaining model without it.
+	body := []byte(`{"model":"claude-haiku-4-5-20251001","thinking":{"type":"enabled","budget_tokens":2048,"display":"updates"}}`)
 	out := reconcileClaudeCodeFableModelAfterPayload(body, claudeCodeFableState{injectedDisplay: true}, false, false, true, false)
 	if display := ojson.GetBytes(out, "thinking.display"); display.Exists() {
 		t.Fatalf("synthetic display survived for non-progress model: %s", out)

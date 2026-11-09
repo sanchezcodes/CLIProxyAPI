@@ -70,8 +70,16 @@ systemctl --user restart cliproxyapi
   continues. Mirrors upstream PRs #3305/#3101 (unmerged as of v7.3.17).
 - **Claude detection floor** (`claudeDetectionBaseline` in
   `internal/runtime/executor/helps/claude_client_detection.go`): native Claude Code
-  user agents from 2.1.258 up keep passthrough. Exact helper-header matching follows
-  upstream's measured baseline.
+  user agents from 2.1.258 up keep passthrough, and their own SDK package (0.112.1+)
+  and runtime (v26.3.0+) headers. Exact helper-header matching stays pinned to the
+  measured 2.1.280 helper profile (`claudeMeasuredHelperProfile`).
+- **Claude Code 2.1.321 cloak baseline** (2026-11-09): Fable 5.2 rejects anything
+  older than 2.1.290, so the outbound fingerprint is 2.1.321 / sdk 0.128.0 / runtime
+  v26.12.1 (`claude_device_profile.go`). The beta order in `claudeCodeCLIBetas`,
+  `thinking.display=updates` on every interleaved-thinking model, and the
+  `cc_prompt_index`/`cc_turn_index` billing fields follow native 2.1.321 captures.
+  Drop this patch once upstream moves its baseline to 2.1.321 or later; to re-measure,
+  run a native binary against a local capture server with `ANTHROPIC_BASE_URL`.
 
 ## Credential settings that upgrades depend on
 

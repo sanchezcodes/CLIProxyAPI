@@ -211,6 +211,38 @@ func generateBillingHeader(cchSigning bool, version, messageText, entrypoint, wo
 	return b.String()
 }
 
+// claudeTurnPositionDoc derives the cc_prompt_index/cc_turn_index pair Claude
+// Code 2.1.321 appends after cc_turn_origin on signed main-thread requests.
+// Claude Code counts every user turn (turnIndex, from 1) and every human prompt
+// among them (promptIndex): a fresh conversation is 1/1, and each tool-result
+// turn advances only turnIndex. The payload carries the same history, so both
+// counters follow from its user messages; a user message holding any
+// tool_result block is a tool turn rather than a human prompt.
+func claudeTurnPositionDoc(doc *ojson.Doc) (promptIndex, turnIndex int, ok bool) {
+	if doc == nil {
+		return 0, 0, false
+	}
+	doc.Get("messages").ForEach(func(_, msg ojson.Result) bool {
+		if msg.Get("role").String() != "user" {
+			return true
+		}
+		turnIndex++
+		toolTurn := false
+		msg.Get("content").ForEach(func(_, block ojson.Result) bool {
+			if block.Get("type").String() == "tool_result" {
+				toolTurn = true
+				return false
+			}
+			return true
+		})
+		if !toolTurn {
+			promptIndex++
+		}
+		return true
+	})
+	return promptIndex, turnIndex, turnIndex >= 1 && promptIndex <= turnIndex
+}
+
 func resolveClaudeContinuityTags(
 	ctx context.Context,
 	cfg *config.Config,
@@ -696,12 +728,12 @@ Report what actually happened, not what you intended. When you say something is 
 
 func checkSystemInstructionsWithMode(payload []byte, strictMode bool, keepCallerSystemTopLevel ...bool) []byte {
 	keepAtTopLevel := len(keepCallerSystemTopLevel) > 0 && keepCallerSystemTopLevel[0]
-	return checkSystemInstructionsWithSigningMode(payload, strictMode, false, "2.1.280", "cli", "", keepAtTopLevel)
+	return checkSystemInstructionsWithSigningMode(payload, strictMode, false, "2.1.321", "cli", "", keepAtTopLevel)
 }
 
 func checkSystemInstructionsWithModeDoc(doc *ojson.Doc, strictMode bool, keepCallerSystemTopLevel ...bool) bool {
 	keepAtTopLevel := len(keepCallerSystemTopLevel) > 0 && keepCallerSystemTopLevel[0]
-	return checkSystemInstructionsWithSigningModeDoc(doc, strictMode, false, "2.1.280", "cli", "", keepAtTopLevel)
+	return checkSystemInstructionsWithSigningModeDoc(doc, strictMode, false, "2.1.321", "cli", "", keepAtTopLevel)
 }
 
 // checkSystemInstructionsWithSigningMode keeps the top-level system in Claude
@@ -717,6 +749,21 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, cch
 func checkSystemInstructionsWithSigningModeDoc(doc *ojson.Doc, strictMode bool, cchSigning bool, version, entrypoint, workload string, keepCallerSystemTopLevel ...bool) bool {
 	keepAtTopLevel := len(keepCallerSystemTopLevel) > 0 && keepCallerSystemTopLevel[0]
 	return checkSystemInstructionsWithSigningModeAtDoc(doc, strictMode, cchSigning, version, entrypoint, workload, claudeCodeLocalDate(time.Now()), false, "", "", keepAtTopLevel, "")
+}
+
+// claudeCloakFallbackModel returns the server-side fallback target native
+// Claude Code attaches for the model, or "" when it sends none. Fable 5.1 and
+// 5.2 fall back to Claude Code's default refusal fallback (opus5) in 2.1.321;
+// Mythos 5.2 has no refusal_fallback capability and gets none.
+func claudeCloakFallbackModel(model string) string {
+	switch {
+	case isClaudeFable51Model(model), isClaudeFable52Model(model):
+		return "claude-opus-5"
+	case isClaudeOpus55Model(model):
+		return "claude-opus-4-8"
+	default:
+		return ""
+	}
 }
 
 // isClaudeFable51Model reports whether the model is specifically Fable 5.1 / Mythos 5.1,
@@ -830,6 +877,11 @@ func checkSystemInstructionsWithSigningModeAtDoc(
 	messageText := claudeBillingFingerprintMessageTextDoc(doc)
 
 	billingText := generateBillingHeader(cchSigning, version, messageText, entrypoint, workload, isSubagent, prevReq, promptID, turnOrigin...)
+	if cchSigning && len(turnOrigin) > 0 && turnOrigin[0] == "human" {
+		if promptIndex, turnIndex, ok := claudeTurnPositionDoc(doc); ok {
+			billingText += " cc_prompt_index=" + strconv.Itoa(promptIndex) + "; cc_turn_index=" + strconv.Itoa(turnIndex) + ";"
+		}
+	}
 	billingBlock := buildTextBlock(billingText, nil)
 
 	isExplicit := (len(turnOrigin) > 1 && turnOrigin[1] == "explicit_cache_mode") || isExplicitPromptCacheModeDoc(doc)
@@ -1760,13 +1812,7 @@ func reconcileClaudeCodeFableModelAfterPayloadDoc(
 	// A model rewrite may change the native fallback target. Never override a
 	// caller or payload-rule fallback; only replace one inserted by the cloak.
 	if fableState.injectedFallbacks && !payloadTouchedFallbacks {
-		wantFallback := ""
-		switch {
-		case isClaudeFable51Model(currentModel):
-			wantFallback = "claude-opus-5"
-		case isClaudeOpus55Model(currentModel):
-			wantFallback = "claude-opus-4-8"
-		}
+		wantFallback := claudeCloakFallbackModel(currentModel)
 		if doc.Get("fallbacks.0.model").String() != wantFallback {
 			if doc.Delete("fallbacks") == nil {
 				changed = true
@@ -1830,15 +1876,15 @@ func reconcileClaudeCodeFableModelAfterPayloadDoc(
 		return changed
 	}
 
-	if isClaudeOpus55Model(currentModel) && !doc.Get("fallbacks").Exists() && !payloadTouchedFallbacks {
-		_ = doc.SetRawBytes("fallbacks", []byte(`[{"model":"claude-opus-4-8"}]`))
+	if wantFallback := claudeCloakFallbackModel(currentModel); wantFallback != "" && !doc.Get("fallbacks").Exists() && !payloadTouchedFallbacks {
+		_ = doc.SetRawBytes("fallbacks", []byte(`[{"model":"`+wantFallback+`"}]`))
 		changed = true
 	}
 	thinkingType := strings.ToLower(strings.TrimSpace(doc.Get("thinking.type").String()))
 	thinkingActive := thinkingType == "adaptive" || thinkingType == "enabled"
 	// Payload rules can disable thinking without touching display. Remove only
 	// CPA's injected value; explicit caller and operator choices remain owned.
-	if fableState.injectedDisplay && !payloadTouchedDisplay && (!thinkingActive || !claudeModelUsesProgressDisplay(currentModel)) {
+	if fableState.injectedDisplay && !payloadTouchedDisplay && (!thinkingActive || !claudeModelUsesThinkingDisplayUpdates(currentModel)) {
 		if doc.Delete("thinking.display") == nil {
 			changed = true
 		}
@@ -2628,13 +2674,8 @@ func applyCloakingInternalDoc(
 	// In native Claude Code 2.1.258, claude-fable-5-1 requests carry:
 	// "fallbacks": [{"model": "claude-opus-5"}]
 	model := strings.ToLower(strings.TrimSpace(doc.Get("model").String()))
-	if isClaudeOpus55Model(model) && !isProbeOrHelper && !doc.Get("fallbacks").Exists() {
-		_ = doc.SetRawBytes("fallbacks", []byte(`[{"model":"claude-opus-4-8"}]`))
-	}
-	if isClaudeFable51Model(model) && !isProbeOrHelper {
-		if !doc.Get("fallbacks").Exists() {
-			_ = doc.SetRawBytes("fallbacks", []byte(`[{"model":"claude-opus-5"}]`))
-		}
+	if wantFallback := claudeCloakFallbackModel(model); wantFallback != "" && !isProbeOrHelper && !doc.Get("fallbacks").Exists() {
+		_ = doc.SetRawBytes("fallbacks", []byte(`[{"model":"`+wantFallback+`"}]`))
 	}
 	if !isProbeOrHelper {
 		applyClaudeCloakThinkingDisplayDoc(doc, false)

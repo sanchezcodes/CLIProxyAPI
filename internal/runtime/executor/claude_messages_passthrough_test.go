@@ -241,7 +241,8 @@ func TestApplyClaudeCloakThinkingDisplay(t *testing.T) {
 		{name: "explicit summarized", model: "claude-opus-5-5", body: `{"model":"claude-opus-5-5","thinking":{"type":"adaptive","display":"summarized"}}`, want: "summarized"},
 		{name: "explicit omitted", model: "claude-sonnet-5", body: `{"model":"claude-sonnet-5","thinking":{"type":"adaptive","display":"omitted"}}`, want: "omitted"},
 		{name: "disabled", model: "claude-opus-5-5", body: `{"model":"claude-opus-5-5","thinking":{"type":"disabled"}}`, want: ""},
-		{name: "legacy model", model: "claude-opus-4-6", body: `{"model":"claude-opus-4-6","thinking":{"type":"adaptive"}}`, want: ""},
+		{name: "older interleaved model", model: "claude-opus-4-6", body: `{"model":"claude-opus-4-6","thinking":{"type":"adaptive"}}`, want: "updates"},
+		{name: "haiku 4.5 has no interleaved thinking", model: "claude-haiku-4-5-20251001", body: `{"model":"claude-haiku-4-5-20251001","thinking":{"type":"enabled","budget_tokens":2048}}`, want: ""},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
