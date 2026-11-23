@@ -2,13 +2,13 @@ package helps
 
 import (
 	"bytes"
-	"encoding/json"
 	"net/http"
-	"regexp"
 	"sort"
 	"strings"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/MoeForge/moego/ojson"
+	"github.com/MoeForge/moego/regexp"
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
@@ -174,7 +174,7 @@ func DetectClaudeCodeRequest(headers http.Header, payload []byte, countTokens bo
 	entrypoint := userAgent.entrypoint
 	subclient := claudeSubclientForEntrypoint(entrypoint, cfg)
 	detection := ClaudeCodeRequestDetection{
-		XAppCLI:         headerValue(headers, "X-App") == "cli",
+		XAppCLI:         isNativeClaudeXApp(headerValue(headers, "X-App")),
 		UserAgent:       validUserAgent && plausibleClaudeCodeVersion(userAgent.version, cfg),
 		BetasPresent:    headerContainsClaudeCodeBeta(headers),
 		Entrypoint:      entrypoint,
@@ -195,6 +195,15 @@ func DetectClaudeCodeRequest(headers http.Header, payload []byte, countTokens bo
 			measuredClaudeCodeHaiku55HelperSessionMatches(headers, payload) &&
 			measuredClaudeCodeBillingAndIdentityMatch(payload, entrypoint))
 	return detection
+}
+
+func isNativeClaudeXApp(value string) bool {
+	switch value {
+	case "cli", "cli-bg":
+		return true
+	default:
+		return false
+	}
 }
 
 func claudeCodeHelperBetaProfile(redactThinking bool, trailing ...string) string {
@@ -257,7 +266,7 @@ func matchesMeasuredClaudeCodeHaiku55HelperProfile(
 }
 
 func measuredClaudeCodeHaiku55HelperHeadersMatch(headers http.Header, cfg *config.Config) bool {
-	profile := claudeMeasuredHelperProfile(cfg)
+	profile := claudeDetectionBaseline(cfg)
 	expected := map[string]string{
 		"Accept":                  "application/json",
 		"Content-Type":            "application/json",
@@ -299,11 +308,11 @@ func measuredClaudeCodeHaiku55HelperHeadersMatch(headers http.Header, cfg *confi
 			return false
 		}
 	}
+	// Claude Code omits prompt-caching-scope when using a non-first-party base URL.
 	betaHeader := normalizedClaudeBetaHeader(headers)
 	return strings.Contains(betaHeader, "interleaved-thinking-2025-05-14") &&
 		strings.Contains(betaHeader, "thinking-token-count-2026-05-13") &&
-		strings.Contains(betaHeader, "context-management-2025-06-27") &&
-		strings.Contains(betaHeader, "prompt-caching-scope-2026-01-05")
+		strings.Contains(betaHeader, "context-management-2025-06-27")
 }
 
 func measuredClaudeCodeHaiku55HelperSessionMatches(headers http.Header, payload []byte) bool {
@@ -428,7 +437,7 @@ func normalizedClaudeBetaHeader(headers http.Header) string {
 // exact beta allowlist, the body shape, the billing CCH and the session binding -
 // stay strict.
 func measuredClaudeCodeHelperHeadersMatch(headers http.Header, cfg *config.Config, shape claudeCodeHelperShape) bool {
-	profile := claudeMeasuredHelperProfile(cfg)
+	profile := defaultClaudeDeviceProfile(cfg)
 	expected := map[string]string{
 		"Accept":                  "application/json",
 		"Content-Type":            "application/json",
@@ -464,7 +473,8 @@ func measuredClaudeCodeHelperHeadersMatch(headers http.Header, cfg *config.Confi
 		candidate.version = version
 		candidate.hasVersion = true
 	}
-	if !meetsClaudeDeviceProfileBaseline(candidate, profile) {
+	if !meetsClaudeDeviceProfileBaseline(candidate, profile) &&
+		!meetsClaudeDeviceProfileBaseline(candidate, claudeMeasuredHelperProfile(cfg)) {
 		return false
 	}
 	// Claude Code 2.1.258 (@anthropic-ai/sdk 0.112.1), measured 2026-09-02 on the
@@ -703,11 +713,11 @@ func claudeDetectionBaseline(cfg *config.Config) ClaudeDeviceProfile {
 	return profile
 }
 
-// claudeMeasuredHelperProfile is the software profile the native helper shapes
-// below were measured on (Claude Code 2.1.280, @anthropic-ai/sdk 0.112.1, runtime
-// v26.3.0). The outbound fingerprint moved to 2.1.321, whose helper betas have
-// not been measured, so helper detection stays pinned to the measured release
-// instead of following the outbound default. Configured header defaults still win.
+// claudeMeasuredHelperProfile is the earlier measured native helper software
+// profile (Claude Code 2.1.280, @anthropic-ai/sdk 0.112.1, runtime v26.3.0).
+// Keeping it accepted alongside defaultClaudeDeviceProfile preserves native
+// helper passthrough for 2.1.280 clients after the default baseline moved to
+// 2.1.321. Configured header defaults still win.
 func claudeMeasuredHelperProfile(cfg *config.Config) ClaudeDeviceProfile {
 	profile := defaultClaudeDeviceProfile(cfg)
 	if cfg != nil && strings.TrimSpace(cfg.ClaudeHeaderDefaults.UserAgent) != "" {

@@ -5,17 +5,18 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf16"
 	"unicode/utf8"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/MoeForge/moego/ojson"
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
@@ -82,7 +83,9 @@ func getCloakConfigFromAuth(auth *cliproxyauth.Auth) (cloakMode string, strictMo
 
 	strictMode = strings.EqualFold(lookupCloakAttr("cloak_strict_mode"), "true")
 
-	if wordsStr := lookupCloakAttr("cloak_sensitive_words"); wordsStr != "" {
+	if metaWords := claudeauth.ReadMetadataStringSlice(&auth.Metadata, "cloak_sensitive_words"); len(metaWords) > 0 {
+		sensitiveWords = metaWords
+	} else if wordsStr := lookupCloakAttr("cloak_sensitive_words"); wordsStr != "" {
 		sensitiveWords = strings.Split(wordsStr, ",")
 		for i := range sensitiveWords {
 			sensitiveWords[i] = strings.TrimSpace(sensitiveWords[i])
@@ -92,6 +95,117 @@ func getCloakConfigFromAuth(auth *cliproxyauth.Auth) (cloakMode string, strictMo
 	cacheUserID = strings.EqualFold(lookupCloakAttr("cloak_cache_user_id"), "true")
 
 	return cloakMode, strictMode, sensitiveWords, cacheUserID
+}
+
+func getCloakReplacementsFromAuth(auth *cliproxyauth.Auth) map[string]string {
+	if auth == nil {
+		return nil
+	}
+	parseJSONStringMap := func(raw string) map[string]string {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" || !strings.HasPrefix(trimmed, "{") || !ojson.Valid(trimmed) {
+			return nil
+		}
+		parsed := ojson.Parse(trimmed)
+		if !parsed.IsObject() {
+			return nil
+		}
+		out := make(map[string]string)
+		parsed.ForEach(func(k, v ojson.Result) bool {
+			if v.Type == ojson.String {
+				out[k.String()] = v.String()
+			}
+			return true
+		})
+		return config.NormalizeSensitiveWordsReplace(out)
+	}
+	if auth.Attributes != nil {
+		if raw := auth.Attributes["cloak_sensitive_words_replace"]; strings.TrimSpace(raw) != "" {
+			if parsed := parseJSONStringMap(raw); len(parsed) > 0 {
+				return parsed
+			}
+		}
+	}
+	if fromMap := claudeauth.ReadMetadataStringMap(&auth.Metadata, "cloak_sensitive_words_replace"); len(fromMap) > 0 {
+		return config.NormalizeSensitiveWordsReplace(fromMap)
+	}
+	if raw := claudeauth.ReadMetadataString(&auth.Metadata, "cloak_sensitive_words_replace"); strings.TrimSpace(raw) != "" {
+		return parseJSONStringMap(raw)
+	}
+	return nil
+}
+
+func sanitizeBlankPatternRules(in []config.SensitivePatternRule) []config.SensitivePatternRule {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]config.SensitivePatternRule, 0, len(in))
+	for _, rule := range in {
+		if strings.TrimSpace(rule.Pattern) == "" {
+			continue
+		}
+		out = append(out, config.SensitivePatternRule{
+			Pattern:     rule.Pattern,
+			Replacement: rule.Replacement,
+		})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func getCloakPatternReplacementsFromAuth(auth *cliproxyauth.Auth) []config.SensitivePatternRule {
+	if auth == nil {
+		return nil
+	}
+	parseJSONPatternList := func(raw string) []config.SensitivePatternRule {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" || !strings.HasPrefix(trimmed, "[") || !ojson.Valid(trimmed) {
+			return nil
+		}
+		parsed := ojson.Parse(trimmed)
+		if !parsed.IsArray() {
+			return nil
+		}
+		var out []config.SensitivePatternRule
+		parsed.ForEach(func(_, item ojson.Result) bool {
+			if !item.IsObject() {
+				return true
+			}
+			patternNode := item.Get("pattern")
+			if patternNode.Type != ojson.String {
+				return true
+			}
+			out = append(out, config.SensitivePatternRule{
+				Pattern:     patternNode.String(),
+				Replacement: item.Get("replacement").String(),
+			})
+			return true
+		})
+		return sanitizeBlankPatternRules(out)
+	}
+	if auth.Attributes != nil {
+		if raw := auth.Attributes["cloak_sensitive_patterns_replace"]; strings.TrimSpace(raw) != "" {
+			if parsed := parseJSONPatternList(raw); len(parsed) > 0 {
+				return parsed
+			}
+		}
+	}
+	if pairs := claudeauth.ReadMetadataPatternPairs(&auth.Metadata, "cloak_sensitive_patterns_replace"); len(pairs) > 0 {
+		out := make([]config.SensitivePatternRule, 0, len(pairs))
+		for _, pair := range pairs {
+			out = append(out, config.SensitivePatternRule{
+				Pattern:     pair[0],
+				Replacement: pair[1],
+			})
+		}
+		return sanitizeBlankPatternRules(out)
+	}
+	if raw := claudeauth.ReadMetadataString(&auth.Metadata, "cloak_sensitive_patterns_replace"); strings.TrimSpace(raw) != "" {
+		return parseJSONPatternList(raw)
+	}
+	return nil
 }
 
 // injectFakeUserID generates and injects a fake user ID into the request metadata.
@@ -209,38 +323,6 @@ func generateBillingHeader(cchSigning bool, version, messageText, entrypoint, wo
 		}
 	}
 	return b.String()
-}
-
-// claudeTurnPositionDoc derives the cc_prompt_index/cc_turn_index pair Claude
-// Code 2.1.321 appends after cc_turn_origin on signed main-thread requests.
-// Claude Code counts every user turn (turnIndex, from 1) and every human prompt
-// among them (promptIndex): a fresh conversation is 1/1, and each tool-result
-// turn advances only turnIndex. The payload carries the same history, so both
-// counters follow from its user messages; a user message holding any
-// tool_result block is a tool turn rather than a human prompt.
-func claudeTurnPositionDoc(doc *ojson.Doc) (promptIndex, turnIndex int, ok bool) {
-	if doc == nil {
-		return 0, 0, false
-	}
-	doc.Get("messages").ForEach(func(_, msg ojson.Result) bool {
-		if msg.Get("role").String() != "user" {
-			return true
-		}
-		turnIndex++
-		toolTurn := false
-		msg.Get("content").ForEach(func(_, block ojson.Result) bool {
-			if block.Get("type").String() == "tool_result" {
-				toolTurn = true
-				return false
-			}
-			return true
-		})
-		if !toolTurn {
-			promptIndex++
-		}
-		return true
-	})
-	return promptIndex, turnIndex, turnIndex >= 1 && promptIndex <= turnIndex
 }
 
 func resolveClaudeContinuityTags(
@@ -751,21 +833,6 @@ func checkSystemInstructionsWithSigningModeDoc(doc *ojson.Doc, strictMode bool, 
 	return checkSystemInstructionsWithSigningModeAtDoc(doc, strictMode, cchSigning, version, entrypoint, workload, claudeCodeLocalDate(time.Now()), false, "", "", keepAtTopLevel, "")
 }
 
-// claudeCloakFallbackModel returns the server-side fallback target native
-// Claude Code attaches for the model, or "" when it sends none. Fable 5.1 and
-// 5.2 fall back to Claude Code's default refusal fallback (opus5) in 2.1.321;
-// Mythos 5.2 has no refusal_fallback capability and gets none.
-func claudeCloakFallbackModel(model string) string {
-	switch {
-	case isClaudeFable51Model(model), isClaudeFable52Model(model):
-		return "claude-opus-5"
-	case isClaudeOpus55Model(model):
-		return "claude-opus-4-8"
-	default:
-		return ""
-	}
-}
-
 // isClaudeFable51Model reports whether the model is specifically Fable 5.1 / Mythos 5.1,
 // matching native Claude Code 2.1.258 family/major/minor checks (AFo = {major:5, minor:1}).
 func isClaudeFable51Model(model string) bool {
@@ -877,11 +944,6 @@ func checkSystemInstructionsWithSigningModeAtDoc(
 	messageText := claudeBillingFingerprintMessageTextDoc(doc)
 
 	billingText := generateBillingHeader(cchSigning, version, messageText, entrypoint, workload, isSubagent, prevReq, promptID, turnOrigin...)
-	if cchSigning && len(turnOrigin) > 0 && turnOrigin[0] == "human" {
-		if promptIndex, turnIndex, ok := claudeTurnPositionDoc(doc); ok {
-			billingText += " cc_prompt_index=" + strconv.Itoa(promptIndex) + "; cc_turn_index=" + strconv.Itoa(turnIndex) + ";"
-		}
-	}
 	billingBlock := buildTextBlock(billingText, nil)
 
 	isExplicit := (len(turnOrigin) > 1 && turnOrigin[1] == "explicit_cache_mode") || isExplicitPromptCacheModeDoc(doc)
@@ -1776,7 +1838,13 @@ func reconcileClaudeCodeFableModelAfterPayloadDoc(
 	// A model rewrite may change the native fallback target. Never override a
 	// caller or payload-rule fallback; only replace one inserted by the cloak.
 	if fableState.injectedFallbacks && !payloadTouchedFallbacks {
-		wantFallback := claudeCloakFallbackModel(currentModel)
+		wantFallback := ""
+		switch {
+		case isClaudeFable51Model(currentModel):
+			wantFallback = "claude-opus-5"
+		case isClaudeOpus55Model(currentModel):
+			wantFallback = "claude-opus-4-8"
+		}
 		if doc.Get("fallbacks.0.model").String() != wantFallback {
 			if doc.Delete("fallbacks") == nil {
 				changed = true
@@ -1840,15 +1908,15 @@ func reconcileClaudeCodeFableModelAfterPayloadDoc(
 		return changed
 	}
 
-	if wantFallback := claudeCloakFallbackModel(currentModel); wantFallback != "" && !doc.Get("fallbacks").Exists() && !payloadTouchedFallbacks {
-		_ = doc.SetRawBytes("fallbacks", []byte(`[{"model":"`+wantFallback+`"}]`))
+	if isClaudeOpus55Model(currentModel) && !doc.Get("fallbacks").Exists() && !payloadTouchedFallbacks {
+		_ = doc.SetRawBytes("fallbacks", []byte(`[{"model":"claude-opus-4-8"}]`))
 		changed = true
 	}
 	thinkingType := strings.ToLower(strings.TrimSpace(doc.Get("thinking.type").String()))
 	thinkingActive := thinkingType == "adaptive" || thinkingType == "enabled"
 	// Payload rules can disable thinking without touching display. Remove only
 	// CPA's injected value; explicit caller and operator choices remain owned.
-	if fableState.injectedDisplay && !payloadTouchedDisplay && (!thinkingActive || !claudeModelUsesThinkingDisplayUpdates(currentModel)) {
+	if fableState.injectedDisplay && !payloadTouchedDisplay && (!thinkingActive || !claudeModelUsesProgressDisplay(currentModel)) {
 		if doc.Delete("thinking.display") == nil {
 			changed = true
 		}
@@ -2346,9 +2414,48 @@ type claudeWirePolicy struct {
 }
 
 type claudeCloakSettings struct {
-	strictMode     bool
-	sensitiveWords []string
-	cacheUserID    bool
+	strictMode               bool
+	sensitiveWords           []string
+	sensitiveWordsReplace    map[string]string
+	sensitivePatternsReplace []config.SensitivePatternRule
+	cacheUserID              bool
+	serverSideFallback       bool
+}
+
+const claudeMatcherCacheCapacity = 1024
+
+var (
+	claudeMatcherCacheMu    sync.RWMutex
+	claudeMatcherCache      = make(map[string]*helps.SensitiveWordMatcher)
+	claudeMatcherCacheOrder []string
+)
+
+func (s claudeCloakSettings) buildSensitiveWordMatcher() *helps.SensitiveWordMatcher {
+	if len(s.sensitiveWords) == 0 && len(s.sensitiveWordsReplace) == 0 && len(s.sensitivePatternsReplace) == 0 {
+		return nil
+	}
+	key := helps.SensitiveWordConfigCacheKeyWithPatterns(s.sensitiveWords, s.sensitiveWordsReplace, s.sensitivePatternsReplace)
+	claudeMatcherCacheMu.RLock()
+	if cached, ok := claudeMatcherCache[key]; ok {
+		claudeMatcherCacheMu.RUnlock()
+		return cached
+	}
+	claudeMatcherCacheMu.RUnlock()
+
+	claudeMatcherCacheMu.Lock()
+	defer claudeMatcherCacheMu.Unlock()
+	if cached, ok := claudeMatcherCache[key]; ok {
+		return cached
+	}
+	if len(claudeMatcherCacheOrder) >= claudeMatcherCacheCapacity {
+		oldest := claudeMatcherCacheOrder[0]
+		claudeMatcherCacheOrder = claudeMatcherCacheOrder[1:]
+		delete(claudeMatcherCache, oldest)
+	}
+	built := helps.BuildSensitiveWordMatcherWithPatterns(s.sensitiveWords, s.sensitiveWordsReplace, s.sensitivePatternsReplace)
+	claudeMatcherCache[key] = built
+	claudeMatcherCacheOrder = append(claudeMatcherCacheOrder, key)
+	return built
 }
 
 func isClaudeCodeIdentitySystemText(text string) bool {
@@ -2461,15 +2568,20 @@ func resolveClaudeWirePolicy(cfg *config.Config, auth *cliproxyauth.Auth, apiKey
 	}
 	cloakCfg := resolveClaudeKeyCloakConfig(cfg, auth)
 	attrMode, attrStrict, attrWords, attrCache := getCloakConfigFromAuth(auth)
+	attrWordsReplace := getCloakReplacementsFromAuth(auth)
+	attrPatternsReplace := getCloakPatternReplacementsFromAuth(auth)
 
 	cloakMode := "auto"
 	if cfg != nil && cfg.DisableClaudeCloakMode {
 		cloakMode = "never"
 	}
 	settings := claudeCloakSettings{
-		strictMode:     attrStrict,
-		sensitiveWords: attrWords,
-		cacheUserID:    attrCache,
+		strictMode:               attrStrict,
+		sensitiveWords:           attrWords,
+		sensitiveWordsReplace:    attrWordsReplace,
+		sensitivePatternsReplace: attrPatternsReplace,
+		cacheUserID:              attrCache,
+		serverSideFallback:       cfg != nil && cfg.Claude.ServerSideFallback,
 	}
 	explicitMode := strings.ToLower(strings.TrimSpace(attrMode))
 	if attrMode != "" {
@@ -2486,13 +2598,19 @@ func resolveClaudeWirePolicy(cfg *config.Config, auth *cliproxyauth.Auth, apiKey
 		if len(cloakCfg.SensitiveWords) > 0 {
 			settings.sensitiveWords = cloakCfg.SensitiveWords
 		}
+		if len(cloakCfg.SensitiveWordsReplace) > 0 {
+			settings.sensitiveWordsReplace = cloakCfg.SensitiveWordsReplace
+		}
+		if len(cloakCfg.SensitivePatternsReplace) > 0 {
+			settings.sensitivePatternsReplace = cloakCfg.SensitivePatternsReplace
+		}
 		if cloakCfg.CacheUserID != nil {
 			settings.cacheUserID = *cloakCfg.CacheUserID
 		}
 	}
 
 	fp := resolveClaudeFingerprintPolicy(cfg, auth, apiKey)
-	cloakConfigured := cloakCfg != nil || attrMode != "" || attrStrict || len(attrWords) > 0 || attrCache
+	cloakConfigured := cloakCfg != nil || attrMode != "" || attrStrict || len(attrWords) > 0 || len(attrWordsReplace) > 0 || len(attrPatternsReplace) > 0 || attrCache
 	trimmedMode := strings.ToLower(strings.TrimSpace(cloakMode))
 	uncloak := !fp.ProfileClaudeCodeCLI && (explicitMode == "never" || explicitMode == "uncloak")
 	explicitNever := trimmedMode == "never" && !uncloak
@@ -2648,11 +2766,15 @@ func applyCloakingInternalDoc(
 		turnOriginArgs...,
 	)
 
-	// In native Claude Code 2.1.258, claude-fable-5-1 requests carry:
-	// "fallbacks": [{"model": "claude-opus-5"}]
-	model := strings.ToLower(strings.TrimSpace(doc.Get("model").String()))
-	if wantFallback := claudeCloakFallbackModel(model); wantFallback != "" && !isProbeOrHelper && !doc.Get("fallbacks").Exists() {
-		_ = doc.SetRawBytes("fallbacks", []byte(`[{"model":"`+wantFallback+`"}]`))
+	// Inject cross-model server-side refusal fallbacks only when explicitly
+	// enabled via upstream.claude.server-side-fallback.
+	if settings.serverSideFallback && !isProbeOrHelper && !doc.Get("fallbacks").Exists() {
+		model := strings.ToLower(strings.TrimSpace(doc.Get("model").String()))
+		if isClaudeOpus55Model(model) {
+			_ = doc.SetRawBytes("fallbacks", []byte(`[{"model":"claude-opus-4-8"}]`))
+		} else if isClaudeFable51Model(model) {
+			_ = doc.SetRawBytes("fallbacks", []byte(`[{"model":"claude-opus-5"}]`))
+		}
 	}
 	if !isProbeOrHelper {
 		applyClaudeCloakThinkingDisplayDoc(doc, false)
@@ -2674,10 +2796,11 @@ func applyCloakingInternalDoc(
 		}
 	}
 
-	// Apply sensitive word obfuscation
-	if obfuscateSensitiveWords && len(settings.sensitiveWords) > 0 {
-		matcher := helps.BuildSensitiveWordMatcher(settings.sensitiveWords)
-		helps.ObfuscateSensitiveWordsDoc(doc, matcher)
+	// Apply sensitive word obfuscation and replacements
+	if obfuscateSensitiveWords {
+		if matcher := settings.buildSensitiveWordMatcher(); matcher != nil {
+			helps.ObfuscateSensitiveWordsDoc(doc, matcher)
+		}
 	}
 
 	return true, true, nil
